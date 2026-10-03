@@ -10,3 +10,14 @@ coverage/
 *.secret
 .DS_Store
 *.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
