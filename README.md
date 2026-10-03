@@ -1,1 +1,162 @@
-warc-revisit-index-core
+# warcarchive
+
+一个用于网页存档回放的本地 Python 库：流式读取 WARC 文件、建立可落盘的
+SQLite 索引、按多种条件稳定查询，并在查询 **revisit（重访）** 记录时解析出
+它实际对应的原始 HTTP 头和正文。
+
+- 纯 Python 标准库实现，**无第三方运行时依赖**，不需要任何网络服务。
+- 全程流式解析：WARC 数据可以按**任意大小的字节块**喂入；正文不落内存，
+  内存占用不随 WARC 文件大小增长。
+- 识别 `response`、`revisit`、`warcinfo`、`metadata`（以及
+  `resource`/`request`/`conversion`/`continuation`）记录，支持纯文本 WARC 和
+  每条记录一个 gzip 成员的 `.warc.gz`。
+- 同一 URI 不同时间的两次抓取是两条独立记录；查询顺序固定，可跨进程复现。
+- revisit 的原始记录找不到、digest 对不上、记录被截断时，抛出**语义明确的
+  专用异常**，不会把空结果或错误正文当正常结果返回。
+
+要求 Python 3.12+。
+
+## 安装
+
+```bash
+# 从源码目录安装
+python -m pip install .
+
+# 带测试依赖
+python -m pip install ".[test]"
+```
+
+## 快速上手
+
+```python
+from warcarchive import Index, Query
+
+# 1) 建索引（流式读取，可反复添加多个 WARC / WARC.GZ）
+idx = Index.create("replay.db")
+idx.add_source("crawl-2026-01.warc")
+idx.add_source("crawl-2026-02.warc.gz")
+idx.close()
+
+# 2) 换一个进程重新打开
+idx = Index.open("replay.db")
+
+# 3) 查询
+for cap in idx.query(Query(uri="https://example.com/")):
+    print(cap.record_type.value, cap.record_id, cap.date, cap.offset, cap.length)
+
+one = idx.get_by_id("urn:uuid:…")
+by_digest = idx.query(Query(payload_digest="sha1:…"))
+```
+
+### 读取正文与解析 revisit
+
+普通 `response` 返回自己的 HTTP 头和正文；`revisit` 会自动找到它指向的原始
+记录并返回**那条记录**的头和正文：
+
+```python
+cap = idx.get_by_id("urn:uuid:revisit-record")
+result = cap.resolve()
+
+result.http_head          # 原始 HTTP 状态行 + 头（bytes）
+result.body               # 原始响应正文（bytes，已处理 chunked 编码）
+result.origin_record_id   # 正文来自哪条记录；普通 response 即它自己
+result.origin_source_path # 正文来自哪个 WARC 文件
+result.origin_offset      # 该原始记录在文件中的偏移 / 长度
+result.payload_digest     # 解析后正文的 payload digest
+result.warnings           # revisit 与原始记录上的解析告警集合
+```
+
+也可以不把整个正文读进内存，使用流式接口：
+
+```python
+for chunk in cap.iter_payload():   # 1 MiB 一块
+    send_to_client(chunk)
+```
+
+### revisit 解析规则
+
+1. 有 `WARC-Refers-To` 时优先按记录 ID 找原始 `response`。
+2. 否则按 `WARC-Profile`：
+   - `identical-payload-digest`：同 URI + 相同 `WARC-Payload-Digest`；
+   - `server-not-modified`：同 URI，取该 revisit 之前最近的一次 response。
+3. revisit 自身或原始记录带 `WARC-Truncated`、候选 digest 不一致、原始记录
+   找不到，都会抛出不同的异常类型（见下）。
+
+### 从字节流读取（不经过文件）
+
+```python
+from warcarchive import read_stream
+
+def chunks():              # 任意分块，1 字节一块也行
+    ...
+
+read_stream(idx, chunks(), source_path="/data/from-network.warc")
+# source_path 用于之后按坐标回读正文；若字节没有落盘，回读时会报 SourceNotFoundError
+```
+
+## 查询条件
+
+`Query` 字段（全部可选，AND 组合）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `uri` | 精确匹配 `WARC-Target-URI` |
+| `record_id` | `WARC-Record-ID`（尖括号可省略） |
+| `payload_digest` | `WARC-Payload-Digest`（base32/hex 写法会归一化） |
+| `record_type` | `"response"` / `"revisit"` / `"warcinfo"` / `"metadata"` … |
+| `from_date` / `to_date` | 抓取时间范围（aware `datetime`，按 UTC 比较） |
+| `limit` | 最多返回条数 |
+
+排序固定为 `(URI, 日期, 来源文件, 文件内顺序)`，因此同一组条件在任何进程、
+任何时间查询，结果和顺序都一致。
+
+每条结果（`RecordView`）带有：
+
+- `offset` / `length`：记录在**原始 WARC 文件**中的偏移和长度（gzip 文件里
+  另有 `compressed_offset` / `compressed_length` 与逻辑坐标）；
+- `warnings`：解析该记录时收集到的告警代码元组（如
+  `record-truncated`、`gzip-member-truncated`、`malformed-http-head`）。
+
+## 校验
+
+```python
+from warcarchive import validate
+
+report = validate(idx)
+report.ok          # True/False
+report.checked     # 记录数
+for issue in report.issues:
+    print(issue.code, issue.record_id, issue.target_uri, issue.detail)
+```
+
+校验会重新从磁盘流式读出每条记录，核对：声明的 payload digest 与重新计算的
+是否一致、revisit 能否解析（目标缺失/digest 不符/截断）、记录或 gzip 成员
+是否被截断、来源文件是否还在。问题以 `ValidationIssue` 形式返回（也可以用
+`iter_issues(idx)` 逐条流式获取），不会在校验中途抛出。
+
+## 错误类型
+
+所有异常都继承 `warcarchive.WarcError`：
+
+| 异常 | 场景 |
+| --- | --- |
+| `WarcFormatError` / `GzipFormatError` | WARC 结构或 gzip 成员损坏 |
+| `SourceNotFoundError` | 索引指向的 WARC 文件不存在 |
+| `TruncatedRecordError` | 按坐标回读时文件提前结束 |
+| `DigestMismatchError` | response 自身声明的 digest 与实算不符 |
+| `RecordNotFoundError` | 按 ID 查不到记录 |
+| `DuplicateRecordIdError` | 同一来源里出现重复 Record-ID |
+| `IndexConsistencyError` | 索引文件损坏或版本不兼容 |
+| `RevisitTargetNotFoundError` | revisit 指向的原始记录找不到 |
+| `RevisitDigestMismatchError` | revisit 与候选原始记录 digest 不一致 |
+| `RevisitProfileError` | revisit profile 无法识别或缺少必要头 |
+| `RevisitTruncatedError` | revisit 或其原始记录被截断 |
+
+## 运行测试
+
+```bash
+python -m pytest
+```
+
+测试会在临时目录里构造 WARC / WARC.GZ（包括跨进程重新打开索引、
+revisit 解析、gzip 截断、内存上限等场景），全程不访问网络。
